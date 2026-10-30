@@ -11,7 +11,10 @@ Board run IDs are the `RUN ID` column — judges verify them against the live bo
 | Step | Change | Run ID | T (s) | M (MB) | Points |
 |---|---|---|---|---|---|
 | 0 | Reference unchanged | — | 32.05 | 228 | 0 |
-| 1 | Correct C baseline (single thread, byte-exact) | (pending) | | | |
+| 1 | Correct C baseline: single-threaded, mmap two-pass, dense latency arena, interning, nearest-rank percentiles. Byte-exact sample `ca6311bb…` + full `495ca096…` ×3 locally (2.32/1.53/1.43 s) | **run-2b904c359cf2** | **0.776** | **42.2** | **44.43** |
+
+Board facts for run-2b904c359cf2 (2026-10-30T15:21:52Z): all 5 gates PASS (check/build/correctness/timeout/sandbox) · T=0.776 s vs ref 32.047 s = **41.3×** · M=42.2 MB · S=154 · D=1 · **K=7.74 → 44.43 pts**. Queued 3.3 s, build 1.59 s, image 117.5 MB.
+Axes left on the table: T (single thread → 12-way split ≈ ×1.77 K), S (154 → ~62 ≈ +11%), M (42 → ~25 MB via streamed output ≈ +8%).
 | 2 | 12-way range partition + line-aligned chunks | | | | |
 | 3 | Byte-prefix hour indexing (no date parsing) | | | | |
 | 4 | Endpoint interning (hash + exact compare) | | | | |
