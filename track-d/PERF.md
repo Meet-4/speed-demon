@@ -12,6 +12,7 @@ Board run IDs are the `RUN ID` column — judges verify them against the live bo
 |---|---|---|---|---|---|
 | 0 | Reference unchanged | — | 32.05 | 228 | 0 |
 | 1 | Correct C baseline (single thread, byte-exact) | (pending) | | | |
+| 2 | Source compressed (fewer code lines, logic identical), byte-exact re-verified sample + full ×3 | (pending) | 6.1–6.3 (local) | ~71 | (board decides) |
 | 2 | 12-way range partition + line-aligned chunks | | | | |
 | 3 | Byte-prefix hour indexing (no date parsing) | | | | |
 | 4 | Endpoint interning (hash + exact compare) | | | | |
