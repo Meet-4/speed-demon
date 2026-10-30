@@ -6,11 +6,10 @@
  * count), numerics parse as exact integers, no floats anywhere. The join is
  * a direct-index region table; aggregates are per-country counters, and
  * names_distinct is exact: names are interned (FNV-1a, open addressing) and
- * each country keeps a bitmap of interned ids. A sliding madvise/fadvise
- * window keeps only ~16 MB of the 202 MB mapping resident, so peak memory
- * is a fraction of the reference's. Fixed capacities cover every scale the
- * generator can emit (spec 2.2, holdout included) with headroom; anything
- * beyond them exits 3 rather than guessing. */
+ * each country keeps a bitmap of interned ids. The board pre-warms /data, so
+ * the mapping costs ~0 in memory.peak: peak memory is our heap alone.
+ * Fixed capacities cover every scale the generator can emit (spec 2.2,
+ * holdout included) with headroom; anything beyond them exits 3. */
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -22,7 +21,6 @@
 #define MAXC 512 /* countries (spec: 240) plus _UNMATCHED */
 #define RTAB (1u << 24) /* region table; ids stay under 10^7 (2.2) */
 #define NSLOT (1u << 19) /* name hash slots; <=2^18 names, load <= 50% */
-#define WINDOW (16 << 20) /* resident slice of the mapping */
 
 static uint32_t nc; /* interned country codes */
 static char ccodes[MAXC][4];
@@ -182,7 +180,7 @@ int main(void) {
   if (base == MAP_FAILED)
     return 1;
   madvise((void *)base, size, MADV_SEQUENTIAL);
-  const unsigned char *p = base, *end = base + size, *win = base;
+  const unsigned char *p = base, *end = base + size;
   if (size >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF)
     p += 3;
   static const char HDR[] = "id,name,note,region_id,amount";
@@ -241,12 +239,6 @@ int main(void) {
         p++;
       else
         exit(3);
-    }
-    if (p - win >= WINDOW) { /* drop the slice we parsed; refaults are clean */
-      madvise((void *)win, (size_t)(p - win), MADV_DONTNEED);
-      posix_fadvise(fd, (off_t)(win - base), (off_t)(p - win),
-                    POSIX_FADV_DONTNEED);
-      win = p;
     }
     uint32_t c = reg < RTAB && rtab[reg] ? rtab[reg] - 1 : UNM;
     int64_t amt = neg ? -(int64_t)cents : (int64_t)cents;
