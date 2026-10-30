@@ -44,8 +44,7 @@ static char *xgrow(char *p, uint32_t *cap, uint32_t need) {
   uint32_t c = *cap ? *cap * 2 : 4096;
   while (c < need)
     c *= 2;
-  *cap = c;
-  return realloc(p, c);
+  return (*cap = c, realloc(p, c));
 }
 
 /* id of the exact byte string s[0..len): FNV-1a, linear probing */
@@ -155,8 +154,9 @@ int main(void) {
       rid = rid * 10 + (*rp++ - '0');
     if (*rp++ != ',')
       exit(3);
-    uint32_t b = (((uint32_t)rp[0] << 16) | ((uint32_t)rp[1] << 8) | rp[2]) *
-                     2654435761u >> 22;
+    uint32_t b =
+        (((uint32_t)rp[0] << 16) | ((uint32_t)rp[1] << 8) | rp[2]) *
+            2654435761u >> 22;
     while (code_slot[b] && memcmp(ccodes[code_slot[b] - 1], rp, 3))
       b = (b + 1) & 1023; /* intern the 3-byte country code */
     if (!code_slot[b]) {
@@ -171,16 +171,16 @@ int main(void) {
     rtab[rid] = code_slot[b]; /* duplicates, if any: last wins, like a dict */
   }
   const uint32_t UNM = nc; /* slot of _UNMATCHED */
-
   fd = open("/data/records.csv", O_RDONLY);
   if (fd < 0 || fstat(fd, &st))
     return 1;
   uint64_t size = (uint64_t)st.st_size;
-  const unsigned char *base = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  const unsigned char *base = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0),
+                      *p, *end;
   if (base == MAP_FAILED)
     return 1;
   madvise((void *)base, size, MADV_SEQUENTIAL);
-  const unsigned char *p = base, *end = base + size;
+  p = base, end = base + size;
   if (size >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF)
     p += 3;
   static const char HDR[] = "id,name,note,region_id,amount";
@@ -193,7 +193,6 @@ int main(void) {
   h_arena = malloc(8u << 20);
   for (uint32_t i = 0; i <= nc; i++)
     g_min[i] = INT64_MAX, g_max[i] = INT64_MIN;
-
   while (p < end) {
     if (end - p >= 3 && p[0] == 0xEF && p[1] == 0xBB && p[2] == 0xBF)
       p += 3; /* a BOM is only legal at a record start */
@@ -202,7 +201,7 @@ int main(void) {
       id = id * 10 + (*p++ - '0');
     p++;
     const unsigned char *nm;
-    uint32_t nml;
+    uint32_t nml, ntl;
     if (*p == '"') { /* name: quoted (the usual case) or empty unquoted */
       p = qfield(p, 1, &nml);
       nm = (const unsigned char *)scr;
@@ -212,9 +211,8 @@ int main(void) {
       nml = (uint32_t)(p - nm);
       p++;
     }
-    uint32_t ntl; /* note: only its unescaped length matters */
     if (*p == '"')
-      p = qfield(p, 0, &ntl);
+      p = qfield(p, 0, &ntl); /* note: only its length matters */
     else {
       const unsigned char *s = p;
       while (*p != ',')
@@ -260,7 +258,6 @@ int main(void) {
     if (!(g_bits[c][wi] & 1ull << (nid & 63)))
       g_bits[c][wi] |= 1ull << (nid & 63), g_dist[c]++;
   }
-
   uint32_t order[MAXC], n = 0;
   for (uint32_t i = 0; i <= nc; i++)
     order[n++] = i;
@@ -283,7 +280,5 @@ int main(void) {
     w = fu(w, g_ob[i]), *w++ = '\n';
   }
   int out = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (out < 0)
-    return 1;
-  return write(out, obuf, (size_t)(w - obuf)) < 0 ? 1 : 0;
+  return out < 0 || write(out, obuf, (size_t)(w - obuf)) < 0 ? 1 : 0;
 }
