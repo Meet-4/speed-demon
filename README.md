@@ -1,6 +1,6 @@
 # Speed Demon 2026 — ZeroSouls
 
-Team **ZeroSouls** (Meet + Hermes) — Speed Demon 2026, tracks **A (Ingest)**, **C (Join)** and **D (Traverse)**.
+Team **ZeroSouls** — Speed Demon 2026, tracks **A (Ingest)**, **C (Join)** and **D (Traverse)**.
 
 Every solution here is **zero-dependency C** (C17, `gcc -O3 -march=native -pthread`), built and run exactly as the scoring harness does: build `FROM gcc:16`, runtime `FROM debian:13-slim`, no network at build, one output file to `/out`.
 
