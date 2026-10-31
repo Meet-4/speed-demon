@@ -7,16 +7,18 @@
  * with the exact byte rule — lowercase A-Z, maximal [a-z0-9] runs — and
  * appending each (term, doc) hit to that term's per-thread run; the
  * within-document dedup is the last element because docs are visited in
- * ascending order and ranges are disjoint. The runs merge into one sorted
- * posting array per term (they are disjoint, so a plain k-way merge
- * needs no dedup); terms over the bitmap threshold become N-bit bitmaps.
- * BOOL evaluates strictly left to right on a per-thread result bitmap:
- * dense sides are word-parallel, sparse sides iterate their ids, and AND
- * against a sparse side rebuilds through a second buffer. PHRASE walks
- * the smallest posting list, filters candidates by membership in the
- * other terms, then verifies each candidate by re-tokenizing its raw
- * text and scanning for the consecutive term sequence. Duplicate query
- * lines reuse the first answer. Documents with no tokens match nothing. */
+ * ascending order and ranges are disjoint. A two-bit bloom over the term
+ * hashes lets most non-term tokens skip the hash probe entirely; a class
+ * table folds and classifies each byte in one load. The runs merge into
+ * one sorted posting array per term (disjoint, so no dedup); terms over
+ * the bitmap threshold become N-bit bitmaps. BOOL evaluates strictly left
+ * to right on a per-thread result bitmap: dense sides are word-parallel,
+ * sparse sides iterate their ids, and AND against a sparse side rebuilds
+ * through a second buffer. PHRASE walks the smallest posting list,
+ * filters candidates by membership in the other terms, then verifies each
+ * candidate by re-tokenizing its raw text and scanning for the
+ * consecutive term sequence. Duplicate query lines reuse the first
+ * answer. Documents with no tokens match nothing. */
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -29,6 +31,7 @@
 #define NTH 12
 #define QCAP (1u << 18) /* distinct query terms */
 #define QHS (1u << 19)  /* term hash slots */
+#define BMB (1u << 22)  /* bloom bits */
 #define MAXT 8         /* terms per query */
 #define BMTH 8000      /* postings-as-bitmap threshold */
 #define NONE 0xFFFFFFFFu
@@ -41,7 +44,8 @@ typedef struct {
 static term_t terms[QCAP];
 static uint32_t qslot[QHS], nterm;
 static char *qarena;
-static uint64_t qabytes;
+static uint64_t qabytes, bloom[BMB / 64];
+static unsigned char cls[256]; /* 0 sep, 1 [a-z0-9], 2 [A-Z] */
 
 static uint32_t nq, qk[50000], qt[50000][MAXT], qop[50000][MAXT],
     qnt[50000], qdup[50000], slen[50000];
@@ -51,13 +55,6 @@ static char *slots;
 static const char *dbase; /* corpus mmap */
 static uint32_t ndoc, *toff, *tlen;
 static uint64_t cnts[NTH];
-
-static char *xgrow(char *p, uint32_t *cap, uint32_t need) {
-  uint32_t c = *cap ? *cap * 2 : 16;
-  while (c < need)
-    c *= 2;
-  return (*cap = c, realloc(p, c * 4));
-}
 
 /* intern a query term (terms are lowercase by the grammar) */
 static uint32_t qint(const char *s, uint32_t len) {
@@ -76,10 +73,14 @@ static uint32_t qint(const char *s, uint32_t len) {
   term_t *t = &terms[nterm];
   *t = (term_t){0};
   t->s = qarena + qabytes, memcpy(t->s, s, len), qabytes += len, t->len = len;
+  bloom[(h ^ (h >> 29)) % BMB / 64] |= 1ull << ((h ^ (h >> 29)) % 64);
+  h *= 1099511628211ULL;
+  bloom[(h ^ (h >> 31)) % BMB / 64] |= 1ull << ((h ^ (h >> 31)) % 64);
   return qslot[b] = ++nterm, nterm - 1;
 }
 
-/* id of the doc token s[0..len) with A-Z folded, or NONE */
+/* id of the doc token s[0..len) with A-Z folded, or NONE; the bloom kills
+ * most probes before the table walk */
 static uint32_t dlookup(const char *s, uint32_t len) {
   uint64_t h = 1469598103934665603ULL;
   for (uint32_t i = 0; i < len; i++) {
@@ -88,7 +89,11 @@ static uint32_t dlookup(const char *s, uint32_t len) {
       c += 32;
     h = (h ^ c) * 1099511628211ULL;
   }
-  uint32_t b = (uint32_t)(h ^ (h >> 29)) & (QHS - 1);
+  uint64_t g = h ^ (h >> 29), h2 = h * 1099511628211ULL, g2 = h2 ^ (h2 >> 31);
+  if (!((bloom[g % BMB / 64] >> (g % 64)) & 1) ||
+      !((bloom[g2 % BMB / 64] >> (g2 % 64)) & 1))
+    return NONE;
+  uint32_t b = (uint32_t)g & (QHS - 1);
   while (qslot[b]) {
     term_t *t = &terms[qslot[b] - 1];
     if (t->len == len) {
@@ -139,31 +144,22 @@ static void *walkwork(void *arg) { /* tokenize a doc range into postings */
                *nl = memchr(tb, '\n', (size_t)(r->p1 - tb));
     toff[d] = (uint32_t)(tb + 1 - dbase), tlen[d] = (uint32_t)(nl - tb - 1);
     for (const char *q = tb + 1; q < nl;) {
-      unsigned c = (unsigned char)*q;
-      if (c >= 'A' && c <= 'Z')
-        c += 32; /* ASCII-lowercase before the token test */
-      if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+      unsigned c = cls[(unsigned char)*q];
+      if (c) {
         const char *s = q;
-        for (;;) {
-          unsigned cc;
+        do
           q++;
-          if (q >= nl)
-            break;
-          cc = (unsigned char)*q;
-          if (cc >= 'A' && cc <= 'Z')
-            cc += 32;
-          if (!((cc >= 'a' && cc <= 'z') || (cc >= '0' && cc <= '9')))
-            break;
-        }
+        while (q < nl && cls[(unsigned char)*q]);
         uint32_t id = dlookup(s, (uint32_t)(q - s));
         if (id != NONE) {
           term_t *t = &terms[id];
-          if (t->plen[r->t] == t->pcap[r->t])
-            t->post[r->t] = (uint32_t *)xgrow((char *)t->post[r->t],
-                                              &t->pcap[r->t],
-                                              t->plen[r->t] + 1);
-          if (!t->post[r->t])
-            exit(2);
+          if (t->plen[r->t] == t->pcap[r->t]) {
+            uint32_t nc = t->pcap[r->t] ? t->pcap[r->t] * 2 : 16,
+                     *np = realloc(t->post[r->t], (size_t)nc * 4);
+            if (!np)
+              exit(2);
+            t->post[r->t] = np, t->pcap[r->t] = nc;
+          }
           if (!t->plen[r->t] || t->post[r->t][t->plen[r->t] - 1] != d)
             t->post[r->t][t->plen[r->t]++] = d;
         }
@@ -201,8 +197,7 @@ static char *finish(char *w, uint64_t cnt, uint64_t sum, uint32_t *scratch,
   w = fu(w, sum);
   for (uint32_t i = 0; i < m; i++)
     *w++ = ' ', w = fu(w, scratch[i]);
-  *w++ = '\n';
-  return w;
+  return *w++ = '\n', w;
 }
 
 /* membership of doc id in term t */
@@ -225,22 +220,11 @@ static uint32_t verify(uint32_t qi, uint32_t id, uint32_t n, uint32_t *tok) {
   const char *p = dbase + toff[id], *e = p + tlen[id];
   uint32_t win = 0;
   while (p < e) {
-    unsigned c = (unsigned char)*p;
-    if (c >= 'A' && c <= 'Z')
-      c += 32;
-    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+    if (cls[(unsigned char)*p]) {
       const char *s = p;
-      for (;;) {
-        unsigned cc;
+      do
         p++;
-        if (p >= e)
-          break;
-        cc = (unsigned char)*p;
-        if (cc >= 'A' && cc <= 'Z')
-          cc += 32;
-        if (!((cc >= 'a' && cc <= 'z') || (cc >= '0' && cc <= '9')))
-          break;
-      }
+      while (p < e && cls[(unsigned char)*p]);
       uint32_t tid = dlookup(s, (uint32_t)(p - s));
       if (win < n)
         tok[win++] = tid;
@@ -375,6 +359,10 @@ static void *qwork(void *arg) {
 }
 
 int main(void) {
+  for (int i = 0; i < 256; i++)
+    cls[i] = (i >= 'a' && i <= 'z') || (i >= '0' && i <= '9')
+                 ? 1
+                 : i >= 'A' && i <= 'Z' ? 2 : 0;
   int fd = open("/data/queries.txt", O_RDONLY);
   struct stat st;
   if (fd < 0 || fstat(fd, &st))
@@ -442,7 +430,7 @@ int main(void) {
     return 2;
 
   /* fixed ranges for the newline count, then aligned doc ranges */
-  brange_t cr[NTH], wr[NTH];
+  brange_t cr[NTH];
   for (int t = 0; t < NTH; t++)
     cr[t] = (brange_t){dbase + dsz * t / NTH, dbase + dsz * (t + 1) / NTH, 0,
                        t};
@@ -454,6 +442,7 @@ int main(void) {
     al[t] = nl ? nl + 1 : al[NTH];
   }
   /* first doc id of each aligned range = newlines before it */
+  brange_t wr[NTH];
   uint64_t doc = 0;
   for (int t = 0; t < NTH; t++) {
     const char *p1 = al[t + 1 < NTH ? t + 1 : NTH];
