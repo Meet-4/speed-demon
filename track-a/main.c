@@ -1,16 +1,15 @@
 /* Speed Demon 2026 — Track A (Ingest), team ZeroSouls. Zero-dependency C17.
  * /data/requests.log -> /out/summary.txt, byte-identical to the reference.
  * Twelve threads over line-aligned ranges of the mmap. Pass 1 counts per
- * (hour, endpoint) group into per-thread intern tables stored back into each
- * thread's own range struct. The merge interns every endpoint string into
- * one global table in fixed thread order and sums counts through the
- * local->global id maps, so ids and totals are deterministic. Pass 2
+ * (hour, endpoint) group into per-thread intern tables. The merge interns
+ * every endpoint string into one global table in fixed thread order and
+ * sums the counts, so global ids and totals are deterministic. Pass 2
  * re-reads the same ranges against the global table (pure lookups by then)
  * and appends each latency to its group slice with an atomic fill counter:
  * the multiset per group is exact, and only the multiset matters because
- * every slice is sorted before the percentiles are read. Group sorts run in
- * parallel over an atomic work counter. Hours are fixed-order; endpoints
- * sort bytewise (prefix first). */
+ * every slice is sorted before the percentiles are read. Group sorts run
+ * in parallel over an atomic work counter. Hours are fixed-order;
+ * endpoints sort bytewise (prefix first). */
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -27,24 +26,25 @@
 #define NTH 12
 #define KEY(h, e) (((uint64_t)(h) * MAXEP) + (e))
 
+/* the intern table in use: one private table per pass-1 worker thread,
+ * the one global table for the merge and pass 2 */
 static __thread char *i_arena;
 static __thread uint32_t *i_len, *i_off, *i_slot, *i_cnt, *i_err;
 static __thread uint64_t *i_hash;
 static __thread int i_nep;
 
-static char *e_arena;
+static char *e_arena; /* the one global table */
 static uint32_t *e_len, *e_off, *e_slot, *g_count, *g_errs;
 static uint64_t *e_hash, *g_pos, *g_fill;
 static int e_nep;
 static uint32_t *g_lat, g_work;
 
-typedef struct { /* one thread's range plus the table it built in pass 1 */
-  const char *p0, *p1;
-  char *arena;
-  uint32_t *len, *off, *slot, *cnt, *err;
-  uint64_t *hash;
-  int nep;
-} range_t;
+/* per-thread tables, saved by each pass-1 worker for the merge */
+static char *t_arena[NTH];
+static uint32_t *t_len[NTH], *t_off[NTH], *t_slot[NTH], *t_cnt[NTH],
+    *t_err[NTH];
+static uint64_t *t_hash[NTH];
+static int t_nep[NTH];
 
 static uint32_t intern(const char *s, uint32_t len) {
   uint64_t h = 1469598103934665603ULL;
@@ -87,6 +87,11 @@ static const char *parse(const char *p, uint32_t *hour, uint32_t *ep,
   return nl + 1;
 }
 
+typedef struct {
+  const char *p0, *p1;
+  int t;
+} range_t;
+
 static void new_table(void) { /* this thread's private pass-1 table */
   i_arena = malloc(1 << 20);
   i_len = calloc(MAXEP, 4), i_off = calloc(MAXEP + 1, 4),
@@ -110,8 +115,9 @@ static void *pass1(void *arg) {
   for (const char *p = r->p0; p < r->p1;)
     p = parse(p, &h, &e, &er, &la), i_cnt[KEY(h, e)]++,
     i_err[KEY(h, e)] += er;
-  r->arena = i_arena, r->len = i_len, r->off = i_off, r->slot = i_slot,
-  r->cnt = i_cnt, r->err = i_err, r->hash = i_hash, r->nep = i_nep;
+  t_arena[r->t] = i_arena, t_len[r->t] = i_len, t_off[r->t] = i_off,
+  t_slot[r->t] = i_slot, t_cnt[r->t] = i_cnt, t_err[r->t] = i_err,
+  t_hash[r->t] = i_hash, t_nep[r->t] = i_nep;
   return NULL;
 }
 
@@ -159,50 +165,6 @@ static char *fu(char *w, uint32_t v) { /* decimal, no leading zeros */
   return w;
 }
 
-static uint32_t nd(uint32_t v) { /* decimal digit count, no leading zeros */
-  uint32_t d = 1;
-  while (v >= 10)
-    v /= 10, d++;
-  return d;
-}
-
-/* parallel output formatter: rows are disjoint, each worker writes only
- * its own slices of obuf, so the result is byte-identical to the serial
- * loop it replaces */
-static uint32_t *fmt_rh, *fmt_rk, *fmt_roff, *fmt_order, fmt_i;
-static char *fmt_obuf, (*fmt_hs)[24];
-static uint32_t fmt_nrows;
-
-static void *fmtwork(void *arg) {
-  (void)arg;
-  for (uint32_t i; (i = __atomic_fetch_add(&fmt_i, 1, __ATOMIC_RELAXED)) <
-                   fmt_nrows;) {
-    uint32_t h = fmt_rh[i], id = fmt_order[fmt_rk[i]];
-    char *w = fmt_obuf + fmt_roff[i];
-    memcpy(w, fmt_hs[h], 20), w += 20, *w++ = ' ';
-    memcpy(w, e_arena + e_off[id], e_len[id]), w += e_len[id], *w++ = ' ';
-    uint32_t n = g_count[KEY(h, id)];
-    uint32_t *v = g_lat + g_pos[KEY(h, id)];
-    w = fu(w, n), *w++ = ' ';
-    w = fu(w, v[(50ULL * n + 99) / 100 - 1]), *w++ = ' ';
-    w = fu(w, v[(95ULL * n + 99) / 100 - 1]), *w++ = ' ';
-    w = fu(w, v[(99ULL * n + 99) / 100 - 1]), *w++ = ' ';
-    w = fu(w, g_errs[KEY(h, id)]), *w++ = ' ';
-    w = fu(w, (uint32_t)(g_errs[KEY(h, id)] * 1000000ULL / n)), *w++ = '\n';
-  }
-  return NULL;
-}
-
-static pthread_t th[NTH];
-static void run12(void *(*fn)(void *), void *args,
-                  size_t stride) { /* fire and join NTH */
-  for (int t = 0; t < NTH; t++)
-    if (pthread_create(&th[t], NULL, fn, (char *)args + t * stride))
-      exit(2);
-  for (int t = 0; t < NTH; t++)
-    pthread_join(th[t], NULL);
-}
-
 int main(void) {
   int fd = open("/data/requests.log", O_RDONLY);
   struct stat st;
@@ -223,14 +185,16 @@ int main(void) {
   const char *starts[NTH + 1];
   starts[0] = b, starts[NTH] = b + size;
   for (int t = 1; t < NTH; t++) {
-    const char *nl =
-        memchr(b + size * t / NTH, '\n', size - size * t / NTH);
+    const char *q = b + size * t / NTH;
+    const char *nl = q < starts[NTH]
+                         ? memchr(q, '\n', (size_t)(starts[NTH] - q))
+                         : NULL;
     starts[t] = nl ? nl + 1 : starts[NTH];
     if (starts[t] < starts[t - 1])
       starts[t] = starts[t - 1];
   }
   for (int t = 0; t < NTH; t++)
-    rng[t] = (range_t){.p0 = starts[t], .p1 = starts[t + 1]};
+    rng[t] = (range_t){starts[t], starts[t + 1], t};
 
   e_arena = malloc(1 << 20);
   e_len = calloc(MAXEP, 4), e_off = calloc(MAXEP + 1, 4),
@@ -244,30 +208,34 @@ int main(void) {
     return 2;
   e_nep = 0;
 
-  run12(pass1, rng, sizeof(range_t));
+  pthread_t th[NTH];
+  for (int t = 0; t < NTH; t++)
+    if (pthread_create(&th[t], NULL, pass1, &rng[t]))
+      return 2;
+  for (int t = 0; t < NTH; t++)
+    pthread_join(th[t], NULL);
 
   /* merge: intern every thread's endpoints into the global table in fixed
    * thread order, then sum counts through the local->global id maps */
   use_global();
   uint32_t *map[NTH];
   for (int t = 0; t < NTH; t++) {
-    map[t] = malloc((size_t)(rng[t].nep ? rng[t].nep : 1) * 4);
+    map[t] = malloc((size_t)(t_nep[t] ? t_nep[t] : 1) * 4);
     if (!map[t])
       return 2;
-    for (int id = 0; id < rng[t].nep; id++)
-      map[t][id] = intern(rng[t].arena + rng[t].off[id], rng[t].len[id]);
+    for (int id = 0; id < t_nep[t]; id++)
+      map[t][id] = intern(t_arena[t] + t_off[t][id], t_len[t][id]);
   }
   e_nep = i_nep;
   for (int t = 0; t < NTH; t++) {
     for (uint32_t h = 0; h < HOURS; h++)
-      for (uint32_t e = 0; e < (uint32_t)rng[t].nep; e++) {
+      for (uint32_t e = 0; e < (uint32_t)t_nep[t]; e++) {
         uint64_t k = KEY(h, map[t][e]);
-        g_count[k] += rng[t].cnt[KEY(h, e)];
-        g_errs[k] += rng[t].err[KEY(h, e)];
+        g_count[k] += t_cnt[t][KEY(h, e)];
+        g_errs[k] += t_err[t][KEY(h, e)];
       }
-    free(rng[t].len), free(rng[t].off), free(rng[t].slot),
-        free(rng[t].hash), free(rng[t].cnt), free(rng[t].err),
-        free(rng[t].arena), free(map[t]);
+    free(t_len[t]), free(t_off[t]), free(t_slot[t]), free(t_hash[t]),
+        free(t_cnt[t]), free(t_err[t]), free(t_arena[t]), free(map[t]);
   }
 
   uint64_t tot = 0;
@@ -277,8 +245,18 @@ int main(void) {
   if (!g_lat)
     return 2;
 
-  run12(pass2, rng, sizeof(range_t));
-  run12(sortwork, NULL, 0);
+  for (int t = 0; t < NTH; t++)
+    if (pthread_create(&th[t], NULL, pass2, &rng[t]))
+      return 2;
+  for (int t = 0; t < NTH; t++)
+    pthread_join(th[t], NULL);
+
+  g_work = 0;
+  for (int t = 0; t < NTH; t++)
+    if (pthread_create(&th[t], NULL, sortwork, NULL))
+      return 2;
+  for (int t = 0; t < NTH; t++)
+    pthread_join(th[t], NULL);
 
   uint32_t *order = malloc((size_t)(e_nep ? e_nep : 1) * 4);
   if (!order)
@@ -291,41 +269,29 @@ int main(void) {
   for (int i = 0, mo = 10, dy = 30, hh = 18; i < HOURS; i++) {
     snprintf(hs[i], 24, "2026-%02d-%02dT%02d:00:00Z", mo, dy, hh);
     if (++hh == 24) {
-      hh = 0;
-      if (++dy == 32 && mo == 10) /* Oct 31 23:00 is the last hour of Oct */
+      hh = 0, ++dy;
+      if (mo == 10 && dy == 32) /* Oct 31 23:00 is the last hour of Oct */
         dy = 1, mo = 11;
     }
   }
 
-  /* row list with precomputed offsets, then rows formatted in parallel
-   * straight into obuf at their offsets: no slot array, output identical */
-  uint32_t nrows = 0, total32 = (uint32_t)HOURS * (uint32_t)e_nep;
-  uint32_t *rh = malloc((size_t)total32 * 4), *rk = malloc((size_t)total32 * 4),
-           *roff = malloc((size_t)total32 * 4);
-  if (!rh || !rk || !roff)
+  char *obuf = malloc(16 << 20), *w = obuf; /* full output is ~10.1 MB */
+  if (!obuf)
     return 2;
-  uint64_t total = 0;
   for (uint32_t h = 0; h < HOURS; h++)
     for (uint32_t k = 0; k < (uint32_t)e_nep; k++) {
       uint32_t id = order[k], n = g_count[KEY(h, id)];
       if (!n)
         continue;
+      memcpy(w, hs[h], 20), w += 20, *w++ = ' ';
+      memcpy(w, e_arena + e_off[id], e_len[id]), w += e_len[id], *w++ = ' ';
       uint32_t *v = g_lat + g_pos[KEY(h, id)];
-      uint32_t d50 = v[(50ULL * n + 99) / 100 - 1],
-               d95 = v[(95ULL * n + 99) / 100 - 1],
-               d99 = v[(99ULL * n + 99) / 100 - 1],
-               er = g_errs[KEY(h, id)],
-               rt = (uint32_t)(er * 1000000ULL / n);
-      uint32_t len = 28 + e_len[id] + nd(n) + nd(d50) + nd(d95) + nd(d99) +
-                     nd(er) + nd(rt); /* 20 hour + 7 SP + 1 LF + digits */
-      rh[nrows] = h, rk[nrows] = k, roff[nrows] = (uint32_t)total;
-      total += len, nrows++;
+      w = fu(w, n), *w++ = ' ';
+      w = fu(w, v[(50ULL * n + 99) / 100 - 1]), *w++ = ' ';
+      w = fu(w, v[(95ULL * n + 99) / 100 - 1]), *w++ = ' ';
+      w = fu(w, v[(99ULL * n + 99) / 100 - 1]), *w++ = ' ';
+      w = fu(w, g_errs[KEY(h, id)]), *w++ = ' ';
+      w = fu(w, (uint32_t)(g_errs[KEY(h, id)] * 1000000ULL / n)), *w++ = '\n';
     }
-  char *obuf = malloc((size_t)total ? (size_t)total : 1);
-  if (!obuf)
-    return 2;
-  fmt_rh = rh, fmt_rk = rk, fmt_roff = roff, fmt_obuf = obuf, fmt_hs = hs,
-  fmt_order = order, fmt_nrows = nrows, fmt_i = 0;
-  run12(fmtwork, NULL, 0);
-  return write(out, obuf, (size_t)total) < 0 ? 1 : 0;
+  return write(out, obuf, (size_t)(w - obuf)) < 0 ? 1 : 0;
 }
