@@ -243,6 +243,38 @@ static void run12(void *(*fn)(void *), void *args, size_t stride) {
     pthread_join(th[t], NULL);
 }
 
+/* post-join fold: each worker pulls whole countries off an atomic
+ * counter, so every g_* row is written by exactly one thread and the
+ * result is deterministic. The popcount over the bitmaps is the heavy
+ * part — 16M+ words at full scale — and it parallelizes cleanly. */
+static uint64_t g_cnt_[MAXC], g_ids_[MAXC], g_dist_[MAXC], g_nb_[MAXC],
+    g_ob_[MAXC];
+static int64_t g_sum_[MAXC], g_min_[MAXC], g_max_[MAXC];
+static uint32_t gwork;
+
+static void *foldwork(void *arg) {
+  (void)arg;
+  uint32_t ncn = nc + 1;
+  for (uint32_t c; (c = __atomic_fetch_add(&gwork, 1, __ATOMIC_RELAXED)) <
+                   ncn;) {
+    g_cnt_[c] = g_ids_[c] = g_dist_[c] = g_nb_[c] = g_ob_[c] = 0;
+    g_sum_[c] = 0, g_min_[c] = INT64_MAX, g_max_[c] = INT64_MIN;
+    for (int t = 0; t < NTH; t++) {
+      acc *a = &t_acc[t][c];
+      g_cnt_[c] += a->cnt, g_ids_[c] += a->ids, g_sum_[c] += a->sum,
+          g_nb_[c] += a->nb, g_ob_[c] += a->ob;
+      if (a->mn < g_min_[c])
+        g_min_[c] = a->mn;
+      if (a->mx > g_max_[c])
+        g_max_[c] = a->mx;
+    }
+    for (uint32_t s = 0; s < NSHARD; s++) /* distinct names: exact popcount */
+      for (uint32_t w = 0; w < SSLOT / 64; w++)
+        g_dist_[c] += (uint64_t)__builtin_popcountll(bits[c][s][w]);
+  }
+  return NULL;
+}
+
 static int keycmp(const void *a, const void *b) { /* bytewise on the key */
   uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
   const char *kx = x < nc ? ccodes[x] : "_UNMATCHED";
@@ -393,22 +425,8 @@ int main(void) {
 
   uint64_t g_cnt[MAXC], g_ids[MAXC], g_dist[MAXC], g_nb[MAXC], g_ob[MAXC];
   int64_t g_sum[MAXC], g_min[MAXC], g_max[MAXC];
-  for (uint32_t c = 0; c <= nc; c++) {
-    g_cnt[c] = g_ids[c] = g_dist[c] = g_nb[c] = g_ob[c] = 0;
-    g_sum[c] = 0, g_min[c] = INT64_MAX, g_max[c] = INT64_MIN;
-    for (int t = 0; t < NTH; t++) {
-      acc *a = &t_acc[t][c];
-      g_cnt[c] += a->cnt, g_ids[c] += a->ids, g_sum[c] += a->sum,
-          g_nb[c] += a->nb, g_ob[c] += a->ob;
-      if (a->mn < g_min[c])
-        g_min[c] = a->mn;
-      if (a->mx > g_max[c])
-        g_max[c] = a->mx;
-    }
-    for (uint32_t s = 0; s < NSHARD; s++) /* distinct names: exact popcount */
-      for (uint32_t w = 0; w < SSLOT / 64; w++)
-        g_dist[c] += (uint64_t)__builtin_popcountll(bits[c][s][w]);
-  }
+  gwork = 0; /* the fold is per-country and read-only elsewhere: race it */
+  run12(foldwork, NULL, 0);
 
   uint32_t order[MAXC], n = 0;
   for (uint32_t i = 0; i <= nc; i++)
@@ -419,19 +437,19 @@ int main(void) {
     return 2;
   for (uint32_t k = 0; k < n; k++) {
     uint32_t i = order[k];
-    if (!g_cnt[i])
+    if (!g_cnt_[i])
       continue; /* a country with no records produces no line */
     uint32_t kl = i < nc ? 3 : 10;
     memcpy(w, i < nc ? ccodes[i] : "_UNMATCHED", kl);
     w += kl, *w++ = ' ';
-    w = fu(w, g_cnt[i]), *w++ = ' ';
-    w = fu(w, g_ids[i]), *w++ = ' ';
-    w = fc(w, g_sum[i]), *w++ = ' ';
-    w = fc(w, g_min[i]), *w++ = ' ';
-    w = fc(w, g_max[i]), *w++ = ' ';
-    w = fu(w, g_dist[i]), *w++ = ' ';
-    w = fu(w, g_nb[i]), *w++ = ' ';
-    w = fu(w, g_ob[i]), *w++ = '\n';
+    w = fu(w, g_cnt_[i]), *w++ = ' ';
+    w = fu(w, g_ids_[i]), *w++ = ' ';
+    w = fc(w, g_sum_[i]), *w++ = ' ';
+    w = fc(w, g_min_[i]), *w++ = ' ';
+    w = fc(w, g_max_[i]), *w++ = ' ';
+    w = fu(w, g_dist_[i]), *w++ = ' ';
+    w = fu(w, g_nb_[i]), *w++ = ' ';
+    w = fu(w, g_ob_[i]), *w++ = '\n';
   }
   int out = open("/out/aggregates.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
   return out < 0 || write(out, obuf, (size_t)(w - obuf)) < 0 ? 1 : 0;
