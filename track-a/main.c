@@ -159,6 +159,40 @@ static char *fu(char *w, uint32_t v) { /* decimal, no leading zeros */
   return w;
 }
 
+static uint32_t nd(uint32_t v) { /* decimal digit count, no leading zeros */
+  uint32_t d = 1;
+  while (v >= 10)
+    v /= 10, d++;
+  return d;
+}
+
+/* parallel output formatter: rows are disjoint, each worker writes only
+ * its own slices of obuf, so the result is byte-identical to the serial
+ * loop it replaces */
+static uint32_t *fmt_rh, *fmt_rk, *fmt_roff, *fmt_order, fmt_i;
+static char *fmt_obuf, (*fmt_hs)[24];
+static uint32_t fmt_nrows;
+
+static void *fmtwork(void *arg) {
+  (void)arg;
+  for (uint32_t i; (i = __atomic_fetch_add(&fmt_i, 1, __ATOMIC_RELAXED)) <
+                   fmt_nrows;) {
+    uint32_t h = fmt_rh[i], id = fmt_order[fmt_rk[i]];
+    char *w = fmt_obuf + fmt_roff[i];
+    memcpy(w, fmt_hs[h], 20), w += 20, *w++ = ' ';
+    memcpy(w, e_arena + e_off[id], e_len[id]), w += e_len[id], *w++ = ' ';
+    uint32_t n = g_count[KEY(h, id)];
+    uint32_t *v = g_lat + g_pos[KEY(h, id)];
+    w = fu(w, n), *w++ = ' ';
+    w = fu(w, v[(50ULL * n + 99) / 100 - 1]), *w++ = ' ';
+    w = fu(w, v[(95ULL * n + 99) / 100 - 1]), *w++ = ' ';
+    w = fu(w, v[(99ULL * n + 99) / 100 - 1]), *w++ = ' ';
+    w = fu(w, g_errs[KEY(h, id)]), *w++ = ' ';
+    w = fu(w, (uint32_t)(g_errs[KEY(h, id)] * 1000000ULL / n)), *w++ = '\n';
+  }
+  return NULL;
+}
+
 static pthread_t th[NTH];
 static void run12(void *(*fn)(void *), void *args,
                   size_t stride) { /* fire and join NTH */
@@ -263,23 +297,35 @@ int main(void) {
     }
   }
 
-  char *obuf = malloc(16 << 20), *w = obuf; /* full output is ~10.1 MB */
-  if (!obuf)
+  /* row list with precomputed offsets, then rows formatted in parallel
+   * straight into obuf at their offsets: no slot array, output identical */
+  uint32_t nrows = 0, total32 = (uint32_t)HOURS * (uint32_t)e_nep;
+  uint32_t *rh = malloc((size_t)total32 * 4), *rk = malloc((size_t)total32 * 4),
+           *roff = malloc((size_t)total32 * 4);
+  if (!rh || !rk || !roff)
     return 2;
+  uint64_t total = 0;
   for (uint32_t h = 0; h < HOURS; h++)
     for (uint32_t k = 0; k < (uint32_t)e_nep; k++) {
       uint32_t id = order[k], n = g_count[KEY(h, id)];
       if (!n)
         continue;
-      memcpy(w, hs[h], 20), w += 20, *w++ = ' ';
-      memcpy(w, e_arena + e_off[id], e_len[id]), w += e_len[id], *w++ = ' ';
       uint32_t *v = g_lat + g_pos[KEY(h, id)];
-      w = fu(w, n), *w++ = ' ';
-      w = fu(w, v[(50ULL * n + 99) / 100 - 1]), *w++ = ' ';
-      w = fu(w, v[(95ULL * n + 99) / 100 - 1]), *w++ = ' ';
-      w = fu(w, v[(99ULL * n + 99) / 100 - 1]), *w++ = ' ';
-      w = fu(w, g_errs[KEY(h, id)]), *w++ = ' ';
-      w = fu(w, (uint32_t)(g_errs[KEY(h, id)] * 1000000ULL / n)), *w++ = '\n';
+      uint32_t d50 = v[(50ULL * n + 99) / 100 - 1],
+               d95 = v[(95ULL * n + 99) / 100 - 1],
+               d99 = v[(99ULL * n + 99) / 100 - 1],
+               er = g_errs[KEY(h, id)],
+               rt = (uint32_t)(er * 1000000ULL / n);
+      uint32_t len = 28 + e_len[id] + nd(n) + nd(d50) + nd(d95) + nd(d99) +
+                     nd(er) + nd(rt); /* 20 hour + 7 SP + 1 LF + digits */
+      rh[nrows] = h, rk[nrows] = k, roff[nrows] = (uint32_t)total;
+      total += len, nrows++;
     }
-  return write(out, obuf, (size_t)(w - obuf)) < 0 ? 1 : 0;
+  char *obuf = malloc((size_t)total ? (size_t)total : 1);
+  if (!obuf)
+    return 2;
+  fmt_rh = rh, fmt_rk = rk, fmt_roff = roff, fmt_obuf = obuf, fmt_hs = hs,
+  fmt_order = order, fmt_nrows = nrows, fmt_i = 0;
+  run12(fmtwork, NULL, 0);
+  return write(out, obuf, (size_t)total) < 0 ? 1 : 0;
 }
