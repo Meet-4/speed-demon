@@ -2,14 +2,16 @@
  * /data/graph.txt + /data/queries.txt -> /out/distances.txt, one line per
  * query: shortest directed distance s->t, or -1. Both inputs are mmap'd (the
  * board pre-warms /data). Two passes over the graph bytes build the CSR: a
- * degree histogram, then a scatter — no raw edge list is stored. Each query
- * runs one Dijkstra over the CSR with a lazy binary min-heap and one
- * generation-stamped dist array, so nothing is reset between queries. Three
- * answers never start a search: s==t is 0; with s!=t, a source with no
- * out-edges or a target with no in-edges is -1. Duplicate query lines reuse
- * the first answer from an open-addressing cache. Distances are 64-bit: a
- * path sums up to (n-1)*(2^32-1), which overflows 32 bits, not 63. */
+ * degree histogram, then a scatter — no raw edge list is stored. Duplicate
+ * query lines are folded first (open-addressing cache keeps the index of the
+ * FIRST occurrence; duplicates print that answer). The unique queries are
+ * solved by 12 threads pulling work from an atomic counter; each thread owns
+ * its dist/stamp generation state and its own on-demand heap, so nothing is
+ * shared except the read-only CSR. Fast answers never start a search: s==t
+ * is 0; with s!=t, a source with no out-edges or a target with no in-edges
+ * is -1. Distances are 64-bit: a path sums up to (n-1)*(2^32-1). */
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,10 +19,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static uint32_t n, *off, *cur, *ev, *ew, *stamp, gen, hn, hcap;
-static uint64_t *dist, *hd;
-static uint32_t *hv;
+#define NTH 12
+
+static uint32_t n, *off, *ev, *ew; /* CSR, read-only during queries */
 static unsigned char *has_in;
+
+/* per-thread search state: nothing else is mutable at query time */
+static __thread uint32_t *stamp, hn, hcap, gen;
+static __thread uint64_t *dist, *hd;
+static __thread uint32_t *hv;
 
 /* Parse an unsigned decimal; the single byte after the digits is the field
  * separator (space, or newline on the last field of a line). */
@@ -104,6 +111,28 @@ static int64_t solve(uint32_t s, uint32_t t) {
   return -1;
 }
 
+static uint32_t nq, *qs, *qt, *qfirst, work;
+static int64_t *ans;
+
+static void *qworker(void *arg) {
+  (void)arg;
+  dist = malloc((size_t)n * 8);
+  stamp = calloc(n, 4);
+  hcap = 1 << 12, hn = 0, gen = 0;
+  hd = malloc((size_t)hcap * 8);
+  hv = malloc((size_t)hcap * 4);
+  if (!dist || !stamp || !hd || !hv)
+    exit(2);
+  for (;;) {
+    uint32_t i = __atomic_fetch_add(&work, 1, __ATOMIC_RELAXED);
+    if (i >= nq)
+      break;
+    if (qfirst[i] == i) /* first occurrence: solve it */
+      ans[i] = solve(qs[i], qt[i]);
+  }
+  return NULL;
+}
+
 int main(void) {
   struct stat st;
   int fd = open("/data/graph.txt", O_RDONLY);
@@ -115,71 +144,102 @@ int main(void) {
   uint64_t nn, mm, u, v, w;
   const char *p, *hdr = num(num(g, &nn), &mm); /* header: n SP m LF */
   n = (uint32_t)nn;
-  off = calloc(n + 1, 4), cur = malloc((size_t)(n + 1) * 4), has_in = calloc(n, 1), dist = malloc((size_t)n * 8), stamp = calloc(n, 4), ev = malloc(mm ? (size_t)mm * 4 : 4), ew = malloc(mm ? (size_t)mm * 4 : 4);
-  if (!off || !cur || !has_in || !dist || !stamp || !ev || !ew)
+  off = calloc(n + 1, 4), ev = malloc(mm ? (size_t)mm * 4 : 4),
+  ew = malloc(mm ? (size_t)mm * 4 : 4), has_in = calloc(n, 1);
+  if (!off || !ev || !ew || !has_in)
     return 2;
-  p = hdr;
-  for (uint64_t i = 0; i < mm; i++) /* pass 1: degrees */
-    p = num(num(num(p, &u), &v), &w), off[u + 1]++, has_in[v] = 1;
-  for (u = 0; u < n; u++)
-    off[u + 1] += off[u];
-  memcpy(cur, off, (size_t)(n + 1) * 4);
-  p = hdr;
-  for (uint64_t i = 0; i < mm; i++) { /* pass 2: scatter into the CSR */
-    p = num(num(num(p, &u), &v), &w);
-    uint32_t c = cur[u]++;
-    ev[c] = (uint32_t)v, ew[c] = (uint32_t)w;
+  {
+    uint32_t *cur = malloc((size_t)(n + 1) * 4);
+    if (!cur)
+      return 2;
+    p = hdr;
+    for (uint64_t i = 0; i < mm; i++) /* pass 1: degrees */
+      p = num(num(num(p, &u), &v), &w), off[u + 1]++, has_in[v] = 1;
+    for (u = 0; u < n; u++)
+      off[u + 1] += off[u];
+    memcpy(cur, off, (size_t)(n + 1) * 4);
+    p = hdr;
+    for (uint64_t i = 0; i < mm; i++) { /* pass 2: scatter into the CSR */
+      p = num(num(num(p, &u), &v), &w);
+      uint32_t c = cur[u]++;
+      ev[c] = (uint32_t)v, ew[c] = (uint32_t)w;
+    }
+    free(cur);
   }
-  free(cur);
+
   int qfd = open("/data/queries.txt", O_RDONLY);
   if (qfd < 0 || fstat(qfd, &st))
     return 1;
-  uint32_t q = 0, qcap = 256;
-  uint32_t *qs = malloc((size_t)qcap * 4), *qt = malloc((size_t)qcap * 4);
+  uint32_t qcap = 256;
+  qs = malloc((size_t)qcap * 4), qt = malloc((size_t)qcap * 4);
   if (!qs || !qt)
     return 2;
+  nq = 0;
   if (st.st_size) {
-    const char *qp = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, qfd, 0), *qe;
+    const char *qp = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE,
+                          qfd, 0),
+               *qe;
     if (qp == MAP_FAILED)
       return 1;
     for (qe = qp + st.st_size; qp < qe;) {
       uint64_t s, t;
       qp = num(num(qp, &s), &t);
-      if (q == qcap) {
+      if (nq == qcap) {
         qcap *= 2;
         qs = realloc(qs, (size_t)qcap * 4);
         qt = realloc(qt, (size_t)qcap * 4);
         if (!qs || !qt)
           return 2;
       }
-      qs[q] = (uint32_t)s, qt[q] = (uint32_t)t, q++;
+      qs[nq] = (uint32_t)s, qt[nq] = (uint32_t)t, nq++;
     }
   }
-  uint32_t ccap = 1 << 12; /* duplicate-query cache, open addressing */
-  while (ccap < 4 * q)
+
+  /* fold duplicates: qfirst[i] = index of the first occurrence of query i */
+  uint32_t ccap = 1 << 12;
+  while (ccap < 4 * nq)
     ccap <<= 1;
   uint64_t *ck = calloc(ccap, 8);
-  int64_t *cv = malloc((size_t)ccap * 8);
-  char *obuf = malloc((size_t)q * 21 + 8), *ow = obuf;
-  if (!ck || !cv || !obuf)
+  uint32_t *cv = malloc((size_t)ccap * 4);
+  qfirst = malloc((size_t)(nq ? nq : 1) * 4);
+  ans = malloc((size_t)(nq ? nq : 1) * 8);
+  if (!ck || !cv || !qfirst || !ans)
     return 2;
-  for (uint32_t i = 0; i < q; i++) {
+  for (uint32_t i = 0; i < nq; i++) {
     uint64_t key = ((uint64_t)qs[i] << 32) | qt[i];
     uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & (ccap - 1);
     while (ck[h] && ck[h] != key + 1)
       h = (h + 1) & (ccap - 1);
-    int64_t ans = ck[h] ? cv[h] : (ck[h] = key + 1, cv[h] = solve(qs[i], qt[i]));
-    if (ans < 0) {
+    if (ck[h])
+      qfirst[i] = cv[h]; /* duplicate: reuse the first occurrence */
+    else
+      ck[h] = key + 1, cv[h] = i, qfirst[i] = i;
+  }
+
+  work = 0;
+  pthread_t th[NTH];
+  for (int t = 0; t < NTH; t++)
+    if (pthread_create(&th[t], NULL, qworker, NULL))
+      return 2;
+  for (int t = 0; t < NTH; t++)
+    pthread_join(th[t], NULL);
+
+  char *obuf = malloc((size_t)nq * 21 + 8), *ow = obuf;
+  if (!obuf)
+    return 2;
+  for (uint32_t i = 0; i < nq; i++) {
+    int64_t a = ans[qfirst[i]];
+    if (a < 0) {
       memcpy(ow, "-1\n", 3);
       ow += 3;
     } else {
       char tmp[20];
       int k = 0;
-      uint64_t a = (uint64_t)ans;
+      uint64_t x = (uint64_t)a;
       do {
-        tmp[k++] = (char)('0' + a % 10);
-        a /= 10;
-      } while (a);
+        tmp[k++] = (char)('0' + x % 10);
+        x /= 10;
+      } while (x);
       while (k)
         *ow++ = tmp[--k];
       *ow++ = '\n';
