@@ -136,9 +136,6 @@ static void *countwork(void *arg) { /* newlines in one fixed byte range */
   return NULL;
 }
 
-#define TCN 4096 /* per-thread token cache, direct-mapped */
-static __thread uint64_t tck[TCN], tcv[TCN]; /* tcv: 0 empty, >=2 id+2 */
-
 static void *walkwork(void *arg) { /* tokenize a doc range into postings */
   brange_t *r = arg;
   uint32_t d = r->d0;
@@ -153,34 +150,7 @@ static void *walkwork(void *arg) { /* tokenize a doc range into postings */
         do
           q++;
         while (q < nl && cls[(unsigned char)*q]);
-        uint32_t L = (uint32_t)(q - s), id = NONE;
-        uint64_t key = 0;
-        for (uint32_t i = 0; i < L && i < 8; i++) { /* fold+pack prefix */
-          unsigned fc = (unsigned char)s[i];
-          if (fc >= 'A' && fc <= 'Z')
-            fc += 32;
-          key = key << 8 | fc;
-        }
-        uint32_t hb = (uint32_t)(key * 0x9E3779B97F4A7C15ULL >> 40) & (TCN - 1);
-        if (tck[hb] == key && tcv[hb] >= 2) { /* prefix hit: verify fully */
-          term_t *tt = &terms[tcv[hb] - 2];
-          uint32_t i = 0;
-          while (i < L && tt->len == L) {
-            unsigned fc = (unsigned char)s[i];
-            if (fc >= 'A' && fc <= 'Z')
-              fc += 32;
-            if ((unsigned char)tt->s[i] != fc)
-              break;
-            i++;
-          }
-          if (i == L)
-            id = (uint32_t)(tcv[hb] - 2);
-        }
-        if (id == NONE) {
-          id = dlookup(s, L);
-          if (id != NONE)
-            tck[hb] = key, tcv[hb] = (uint64_t)id + 2;
-        }
+        uint32_t id = dlookup(s, (uint32_t)(q - s));
         if (id != NONE) {
           term_t *t = &terms[id];
           if (t->plen[r->t] == t->pcap[r->t]) {
@@ -304,10 +274,14 @@ static void answer(uint32_t qi, uint64_t *R, uint64_t *R2, uint32_t *scratch,
     for (uint32_t j = 1; j < n; j++) {
       term_t *t = &terms[qt[qi][j]];
       uint32_t op = qop[qi][j - 1];
-      if (t->bm) { /* word-parallel: and / or / and-not by op */
+      if (t->bm) {
         for (uint32_t x = 0; x < NW; x++)
-          R[x] = op == 0 ? R[x] & t->bm[x]
-                         : op == 1 ? R[x] | t->bm[x] : R[x] & ~t->bm[x];
+          if (op == 0)
+            R[x] &= t->bm[x];
+          else if (op == 1)
+            R[x] |= t->bm[x];
+          else
+            R[x] &= ~t->bm[x];
       } else if (t->ids) {
         if (op == 0) {
           memset(R2, 0, (size_t)NW * 8);
@@ -493,12 +467,12 @@ int main(void) {
       for (int u = 0; u < NTH; u++)
         for (uint32_t i = 0; i < t->plen[u]; i++)
           t->bm[t->post[u][i] >> 6] |= 1ull << (t->post[u][i] & 63);
-    } else { /* k-way merge of disjoint sorted runs: no dedup needed */
+    } else {
       t->ids = malloc((size_t)df * 4);
-      uint32_t idx[NTH], out = 0;
-      memset(idx, 0, sizeof idx);
       if (!t->ids)
         return 2;
+      uint32_t idx[NTH], out = 0;
+      memset(idx, 0, sizeof idx);
       for (;;) {
         int best = -1;
         for (int u = 0; u < NTH; u++)
