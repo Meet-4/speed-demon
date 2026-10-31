@@ -1,15 +1,16 @@
 /* Speed Demon 2026 — Track A (Ingest), team ZeroSouls. Zero-dependency C17.
  * /data/requests.log -> /out/summary.txt, byte-identical to the reference.
  * Twelve threads over line-aligned ranges of the mmap. Pass 1 counts per
- * (hour, endpoint) group into per-thread intern tables. The merge interns
- * every endpoint string into one global table in fixed thread order and
- * sums the counts, so global ids and totals are deterministic. Pass 2
+ * (hour, endpoint) group into per-thread intern tables stored back into each
+ * thread's own range struct. The merge interns every endpoint string into
+ * one global table in fixed thread order and sums counts through the
+ * local->global id maps, so ids and totals are deterministic. Pass 2
  * re-reads the same ranges against the global table (pure lookups by then)
  * and appends each latency to its group slice with an atomic fill counter:
  * the multiset per group is exact, and only the multiset matters because
- * every slice is sorted before the percentiles are read. Group sorts run
- * in parallel over an atomic work counter. Hours are fixed-order;
- * endpoints sort bytewise (prefix first). */
+ * every slice is sorted before the percentiles are read. Group sorts run in
+ * parallel over an atomic work counter. Hours are fixed-order; endpoints
+ * sort bytewise (prefix first). */
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -26,25 +27,24 @@
 #define NTH 12
 #define KEY(h, e) (((uint64_t)(h) * MAXEP) + (e))
 
-/* the intern table in use: one private table per pass-1 worker thread,
- * the one global table for the merge and pass 2 */
 static __thread char *i_arena;
 static __thread uint32_t *i_len, *i_off, *i_slot, *i_cnt, *i_err;
 static __thread uint64_t *i_hash;
 static __thread int i_nep;
 
-static char *e_arena; /* the one global table */
+static char *e_arena;
 static uint32_t *e_len, *e_off, *e_slot, *g_count, *g_errs;
 static uint64_t *e_hash, *g_pos, *g_fill;
 static int e_nep;
 static uint32_t *g_lat, g_work;
 
-/* per-thread tables, saved by each pass-1 worker for the merge */
-static char *t_arena[NTH];
-static uint32_t *t_len[NTH], *t_off[NTH], *t_slot[NTH], *t_cnt[NTH],
-    *t_err[NTH];
-static uint64_t *t_hash[NTH];
-static int t_nep[NTH];
+typedef struct { /* one thread's range plus the table it built in pass 1 */
+  const char *p0, *p1;
+  char *arena;
+  uint32_t *len, *off, *slot, *cnt, *err;
+  uint64_t *hash;
+  int nep;
+} range_t;
 
 static uint32_t intern(const char *s, uint32_t len) {
   uint64_t h = 1469598103934665603ULL;
@@ -87,11 +87,6 @@ static const char *parse(const char *p, uint32_t *hour, uint32_t *ep,
   return nl + 1;
 }
 
-typedef struct {
-  const char *p0, *p1;
-  int t;
-} range_t;
-
 static void new_table(void) { /* this thread's private pass-1 table */
   i_arena = malloc(1 << 20);
   i_len = calloc(MAXEP, 4), i_off = calloc(MAXEP + 1, 4),
@@ -115,9 +110,8 @@ static void *pass1(void *arg) {
   for (const char *p = r->p0; p < r->p1;)
     p = parse(p, &h, &e, &er, &la), i_cnt[KEY(h, e)]++,
     i_err[KEY(h, e)] += er;
-  t_arena[r->t] = i_arena, t_len[r->t] = i_len, t_off[r->t] = i_off,
-  t_slot[r->t] = i_slot, t_cnt[r->t] = i_cnt, t_err[r->t] = i_err,
-  t_hash[r->t] = i_hash, t_nep[r->t] = i_nep;
+  r->arena = i_arena, r->len = i_len, r->off = i_off, r->slot = i_slot,
+  r->cnt = i_cnt, r->err = i_err, r->hash = i_hash, r->nep = i_nep;
   return NULL;
 }
 
@@ -165,6 +159,16 @@ static char *fu(char *w, uint32_t v) { /* decimal, no leading zeros */
   return w;
 }
 
+static pthread_t th[NTH];
+static void run12(void *(*fn)(void *), void *args,
+                  size_t stride) { /* fire and join NTH */
+  for (int t = 0; t < NTH; t++)
+    if (pthread_create(&th[t], NULL, fn, (char *)args + t * stride))
+      exit(2);
+  for (int t = 0; t < NTH; t++)
+    pthread_join(th[t], NULL);
+}
+
 int main(void) {
   int fd = open("/data/requests.log", O_RDONLY);
   struct stat st;
@@ -185,16 +189,14 @@ int main(void) {
   const char *starts[NTH + 1];
   starts[0] = b, starts[NTH] = b + size;
   for (int t = 1; t < NTH; t++) {
-    const char *q = b + size * t / NTH;
-    const char *nl = q < starts[NTH]
-                         ? memchr(q, '\n', (size_t)(starts[NTH] - q))
-                         : NULL;
+    const char *nl =
+        memchr(b + size * t / NTH, '\n', size - size * t / NTH);
     starts[t] = nl ? nl + 1 : starts[NTH];
     if (starts[t] < starts[t - 1])
       starts[t] = starts[t - 1];
   }
   for (int t = 0; t < NTH; t++)
-    rng[t] = (range_t){starts[t], starts[t + 1], t};
+    rng[t] = (range_t){.p0 = starts[t], .p1 = starts[t + 1]};
 
   e_arena = malloc(1 << 20);
   e_len = calloc(MAXEP, 4), e_off = calloc(MAXEP + 1, 4),
@@ -208,34 +210,30 @@ int main(void) {
     return 2;
   e_nep = 0;
 
-  pthread_t th[NTH];
-  for (int t = 0; t < NTH; t++)
-    if (pthread_create(&th[t], NULL, pass1, &rng[t]))
-      return 2;
-  for (int t = 0; t < NTH; t++)
-    pthread_join(th[t], NULL);
+  run12(pass1, rng, sizeof(range_t));
 
   /* merge: intern every thread's endpoints into the global table in fixed
    * thread order, then sum counts through the local->global id maps */
   use_global();
   uint32_t *map[NTH];
   for (int t = 0; t < NTH; t++) {
-    map[t] = malloc((size_t)(t_nep[t] ? t_nep[t] : 1) * 4);
+    map[t] = malloc((size_t)(rng[t].nep ? rng[t].nep : 1) * 4);
     if (!map[t])
       return 2;
-    for (int id = 0; id < t_nep[t]; id++)
-      map[t][id] = intern(t_arena[t] + t_off[t][id], t_len[t][id]);
+    for (int id = 0; id < rng[t].nep; id++)
+      map[t][id] = intern(rng[t].arena + rng[t].off[id], rng[t].len[id]);
   }
   e_nep = i_nep;
   for (int t = 0; t < NTH; t++) {
     for (uint32_t h = 0; h < HOURS; h++)
-      for (uint32_t e = 0; e < (uint32_t)t_nep[t]; e++) {
+      for (uint32_t e = 0; e < (uint32_t)rng[t].nep; e++) {
         uint64_t k = KEY(h, map[t][e]);
-        g_count[k] += t_cnt[t][KEY(h, e)];
-        g_errs[k] += t_err[t][KEY(h, e)];
+        g_count[k] += rng[t].cnt[KEY(h, e)];
+        g_errs[k] += rng[t].err[KEY(h, e)];
       }
-    free(t_len[t]), free(t_off[t]), free(t_slot[t]), free(t_hash[t]),
-        free(t_cnt[t]), free(t_err[t]), free(t_arena[t]), free(map[t]);
+    free(rng[t].len), free(rng[t].off), free(rng[t].slot),
+        free(rng[t].hash), free(rng[t].cnt), free(rng[t].err),
+        free(rng[t].arena), free(map[t]);
   }
 
   uint64_t tot = 0;
@@ -245,18 +243,8 @@ int main(void) {
   if (!g_lat)
     return 2;
 
-  for (int t = 0; t < NTH; t++)
-    if (pthread_create(&th[t], NULL, pass2, &rng[t]))
-      return 2;
-  for (int t = 0; t < NTH; t++)
-    pthread_join(th[t], NULL);
-
-  g_work = 0;
-  for (int t = 0; t < NTH; t++)
-    if (pthread_create(&th[t], NULL, sortwork, NULL))
-      return 2;
-  for (int t = 0; t < NTH; t++)
-    pthread_join(th[t], NULL);
+  run12(pass2, rng, sizeof(range_t));
+  run12(sortwork, NULL, 0);
 
   uint32_t *order = malloc((size_t)(e_nep ? e_nep : 1) * 4);
   if (!order)
@@ -269,8 +257,8 @@ int main(void) {
   for (int i = 0, mo = 10, dy = 30, hh = 18; i < HOURS; i++) {
     snprintf(hs[i], 24, "2026-%02d-%02dT%02d:00:00Z", mo, dy, hh);
     if (++hh == 24) {
-      hh = 0, ++dy;
-      if (mo == 10 && dy == 32) /* Oct 31 23:00 is the last hour of Oct */
+      hh = 0;
+      if (++dy == 32 && mo == 10) /* Oct 31 23:00 is the last hour of Oct */
         dy = 1, mo = 11;
     }
   }
