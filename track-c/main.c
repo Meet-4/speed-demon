@@ -161,16 +161,13 @@ static const unsigned char *record(const unsigned char *p, acc *a) {
   } else {
     for (nm = p; *p != ',';)
       p++;
-    nml = (uint32_t)(p - nm);
-    p++;
+    nml = (uint32_t)(p - nm), p++;
   }
   if (*p == '"')
     p = qfield(p, 0, &ntl); /* note: only its length matters */
-  else {
-    const unsigned char *s = p;
-    while (*p != ',')
-      p++;
-    ntl = (uint32_t)(p - s);
+  else { /* unquoted: p++ past the comma belongs HERE, not to both paths */
+    for (ntl = 0; *p != ','; p++)
+      ntl++;
     p++;
   }
   while (*p != ',')
@@ -235,6 +232,15 @@ static void *qcountwork(void *arg) { /* quote bytes in a fixed byte range */
   }
   qcount[r->t] = n;
   return NULL;
+}
+
+static pthread_t th[NTH];
+static void run12(void *(*fn)(void *), void *args, size_t stride) {
+  for (int t = 0; t < NTH; t++)
+    if (pthread_create(&th[t], NULL, fn, (char *)args + t * stride))
+      exit(2);
+  for (int t = 0; t < NTH; t++)
+    pthread_join(th[t], NULL);
 }
 
 static int keycmp(const void *a, const void *b) { /* bytewise on the key */
@@ -328,9 +334,8 @@ int main(void) {
 
   bits = calloc((size_t)MAXC * NSHARD * (SSLOT / 64), 8);
   for (uint32_t i = 0; i < NSHARD; i++) {
-    sh[i].slot = calloc(SSLOT, 4);
-    sh[i].eh = malloc((size_t)(SSLOT / 2) * 8);
-    sh[i].eo = malloc((size_t)(SSLOT / 2) * 4);
+    sh[i].slot = calloc(SSLOT, 4), sh[i].eh = malloc((size_t)(SSLOT / 2) * 8);
+    sh[i].eo = malloc((size_t)(SSLOT / 2) * 4),
     sh[i].el = malloc((size_t)(SSLOT / 2) * 4);
     sh[i].arena = malloc(8u << 20), sh[i].acap = 8u << 20;
     if (!sh[i].slot || !sh[i].eh || !sh[i].eo || !sh[i].el || !sh[i].arena)
@@ -339,14 +344,9 @@ int main(void) {
 
   /* fixed byte ranges, only for the quote count */
   range qr[NTH];
-  pthread_t th[NTH];
-  for (int t = 0; t < NTH; t++) {
-    qr[t] = (range){base + size * t / NTH, base + size * (t + 1) / NTH, t};
-    if (pthread_create(&th[t], NULL, qcountwork, &qr[t]))
-      return 2;
-  }
   for (int t = 0; t < NTH; t++)
-    pthread_join(th[t], NULL);
+    qr[t] = (range){base + size * t / NTH, base + size * (t + 1) / NTH, t};
+  run12(qcountwork, qr, sizeof(range));
 
   /* record ranges: from each boundary, step to the first LF at even quote
    * parity (the running sum of quote bytes is the parity) */
@@ -387,13 +387,9 @@ int main(void) {
     for (int t = 0; t < NTH; t++)
       t_acc[t][i].mn = INT64_MAX, t_acc[t][i].mx = INT64_MIN;
   range rr2[NTH];
-  for (int t = 0; t < NTH; t++) {
-    rr2[t] = (range){starts[t], starts[t + 1], t};
-    if (pthread_create(&th[t], NULL, worker, &rr2[t]))
-      return 2;
-  }
   for (int t = 0; t < NTH; t++)
-    pthread_join(th[t], NULL);
+    rr2[t] = (range){starts[t], starts[t + 1], t};
+  run12(worker, rr2, sizeof(range));
 
   uint64_t g_cnt[MAXC], g_ids[MAXC], g_dist[MAXC], g_nb[MAXC], g_ob[MAXC];
   int64_t g_sum[MAXC], g_min[MAXC], g_max[MAXC];
