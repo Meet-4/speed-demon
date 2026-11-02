@@ -274,14 +274,10 @@ static void answer(uint32_t qi, uint64_t *R, uint64_t *R2, uint32_t *scratch,
     for (uint32_t j = 1; j < n; j++) {
       term_t *t = &terms[qt[qi][j]];
       uint32_t op = qop[qi][j - 1];
-      if (t->bm) {
+      if (t->bm) { /* word-parallel and / or / and-not */
         for (uint32_t x = 0; x < NW; x++)
-          if (op == 0)
-            R[x] &= t->bm[x];
-          else if (op == 1)
-            R[x] |= t->bm[x];
-          else
-            R[x] &= ~t->bm[x];
+          R[x] = op == 0 ? R[x] & t->bm[x]
+                         : op == 1 ? R[x] | t->bm[x] : R[x] & ~t->bm[x];
       } else if (t->ids) {
         if (op == 0) {
           memset(R2, 0, (size_t)NW * 8);
@@ -291,13 +287,10 @@ static void answer(uint32_t qi, uint64_t *R, uint64_t *R2, uint32_t *scratch,
               R2[id >> 6] |= 1ull << (id & 63);
           }
           memcpy(R, R2, (size_t)NW * 8);
-        } else
+        } else /* or sets the bit, not clears it */
           for (uint32_t i = 0; i < t->df; i++) {
-            uint32_t id = t->ids[i];
-            if (op == 1)
-              R[id >> 6] |= 1ull << (id & 63);
-            else
-              R[id >> 6] &= ~(1ull << (id & 63));
+            uint32_t id = t->ids[i], x = id >> 6;
+            R[x] = op == 1 ? R[x] | 1ull << (id & 63) : R[x] & ~(1ull << (id & 63));
           }
       } else if (op == 0) /* absent term: AND empties, OR/NOT unchanged */
         memset(R, 0, (size_t)NW * 8);
@@ -467,12 +460,12 @@ int main(void) {
       for (int u = 0; u < NTH; u++)
         for (uint32_t i = 0; i < t->plen[u]; i++)
           t->bm[t->post[u][i] >> 6] |= 1ull << (t->post[u][i] & 63);
-    } else {
+    } else { /* k-way merge of disjoint sorted runs: no dedup needed */
       t->ids = malloc((size_t)df * 4);
-      if (!t->ids)
-        return 2;
       uint32_t idx[NTH], out = 0;
       memset(idx, 0, sizeof idx);
+      if (!t->ids)
+        return 2;
       for (;;) {
         int best = -1;
         for (int u = 0; u < NTH; u++)
